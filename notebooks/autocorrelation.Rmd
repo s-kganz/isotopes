@@ -1,0 +1,111 @@
+---
+title: "Measures of autocorrelation"
+output:
+  html_document:
+    df_print: paged
+bibliography: isoscapes.bib
+---
+This notebook contains exploratory analysis on the Oak dataset in @watkinsonDevelopmentUseIsoscapes2020. These results inform our cross-validation strategy later.
+
+```{r setup, include=FALSE}
+library(mgcv)
+library(MuMIn)
+library(maps)
+library(tidyverse)
+library(IsoriX)
+library(lubridate)
+library(janitor)
+library(DHARMa)
+library(terra)
+library(nlme)
+library(sf)
+library(gstat)
+library(hopkins)
+library(ape)
+theme_set(theme_bw())
+```
+## Sample Map
+
+Many samples come from the same location. Let's begin by visualizing where they are.
+
+```{r sample-map}
+trees <- read_csv("../data_in/Tree_ds_sep16.csv") %>%
+  clean_names()
+
+trees %>%
+  group_by(latitude, longitude) %>%
+  summarize(n=n()) %>%
+  ungroup() %>%
+  ggplot(aes(longitude, latitude)) +
+  annotation_borders("state") +
+  geom_point(aes(color=factor(n))) +
+  scale_size_area() +
+  coord_quickmap() +
+  labs(color="# duplicates") +
+  theme_void()
+```
+
+## Variograms
+
+Variograms are a useful tool to visualize spatial autocorrelation in a value of interest. Here we plot the empirical semivariogram for each SIR, ignoring points with identical coordinates.
+
+```{r variograms}
+sirs <- c("d18o", "d2h", "d13c", "d34s")
+
+trees_geo <- trees %>%
+  group_by(latitude, longitude) %>%
+  summarize_at(all_of(sirs), mean) %>%
+  st_as_sf(coords=c("longitude", "latitude")) %>%
+  st_set_crs(4326) %>%
+  # convert to projected coordinate system for more accurate
+  # euclidean distances
+  st_transform(3857)
+
+
+variogram_df <- map(
+  sirs, function(sir) {
+    variogram(as.formula(paste(sir, "~ 1")), trees_geo) %>%
+      mutate(id=sir) %>%
+      return()
+  }
+) %>%
+  list_rbind()
+
+
+ggplot(variogram_df, aes(x=dist/1000, y=gamma)) +
+  geom_point() +
+  facet_wrap(~ id, ncol=2, scales="free") +
+  labs(y="Semivariance", x="Lag distance (km)")
+```
+
+Of these, only $\delta^{18}$O and perhaps $\delta^2$H seem to show autocorrelation structure. For $\delta^{13}$C and $\delta^{34}$S, the semivariance does not show a trend with lag distance. This indicates that these variables are not autocorrelated.
+
+This result is consistent with prior isoscape models [@goriStableIsotopeRatio2025]. Both $\delta^{18}$O and $\delta^2$H show strong relationships with altitude and latitude, conferring spatial structure. The ratio $\delta^{34}$S has a weaker relationship with altitude and latitude and is also influenced by local soil properties, which reduces autocorrelation. Although $\delta^{13}$C is not autocorrelated in this sample, there is evidence that this value varies over much larger scales than 1000 km.
+
+## Moran's I
+
+Another measure of spatial autocorrelation is Moran's $I$. This is a global correlation coefficient describing how similar values are when close together in space. We can compute this value and run a hypothesis test for its significance on each SIR.
+
+```{r moran-test}
+
+trees_x <- map_dbl(trees_geo$geometry, function(x) x[1])
+trees_y <- map_dbl(trees_geo$geometry, function(x) x[2])
+
+trees_dist <- dist(cbind(trees_x, trees_y)) %>% as.matrix()
+weight <- 1/trees_dist # weight = 1/distance
+diag(weight) <- 0
+
+moran_result <- list_rbind(
+  map(sirs, function(x) {
+    Moran.I(trees_geo[[x]], weight) %>% as.data.frame() %>% mutate(ratio=x)
+  })
+)
+
+moran_result %>%
+  select(ratio, everything()) %>%
+  knitr::kable()
+```
+
+This result affirms our conclusion from the variograms that $\delta^{18}$O and $\delta^2$H are spatially autocorrelated while $\delta^{13}$C is not spatially autocorrelated. We also found some evidence that $\delta^{34}$S is autocorrelated, even if that was not apparent from the variograms.
+
+## References

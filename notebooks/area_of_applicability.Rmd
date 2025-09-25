@@ -1,0 +1,256 @@
+---
+title: "Spatial CV & Area of Applicability"
+output: html_notebook
+bibliography: isoscapes.bib
+---
+
+@meyerPredictingUnknownSpace2021 propose a workflow for using spatial cross-validation to define the region where a spatial model's inferences are valid. They call this region the area of applicability. In this notebook we demonstrate this workflow for the $\delta^{18}$O samples in the Quercus dataset.
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(IsoriX)
+library(lubridate)
+library(janitor)
+library(terra)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+theme_set(theme_bw())
+
+source("../scripts/aoa.R")
+source("../scripts/metrics.R")
+```
+
+## Define area of applicability
+
+```{r clusters}
+trees <- read_csv("../data_in/Tree_ds_sep16.csv") %>%
+  clean_names() %>%
+  # Drop observations on west coast
+  filter(longitude > -100) %>%
+  # Parse datetimes
+  mutate(date_collected = parse_date_time(date_collected, orders=c("dmy", "mdy")))
+
+# Convert to isorix format
+trees_iso <- trees %>%
+  transmute(
+    source_ID = factor(paste("site", latitude, longitude, elevation_dem, sep = "_")),
+    lat=latitude,
+    long=longitude,
+    elev=elevation_dem,
+    year=year(date_collected),
+    month=month(date_collected),
+    d18o=d18o,
+    d2h=d2h,
+    d13c=d13c,
+    d34s=d34s
+  )
+
+# Discard duplicate points when assigning to folds
+trees_coords <- trees_iso %>%
+  select(long, lat) %>%
+  distinct()
+
+# Run kmeans on coordinates, assign fold
+trees_km <- kmeans(trees_coords, centers=5)
+trees_coords$fold <- trees_km$cluster
+trees_iso <- left_join(trees_iso, trees_coords, by=c("long", "lat"))
+
+# Map of cluster and centroids
+trees_iso %>%
+  ggplot(aes(long, lat)) +
+  annotation_borders("state") +
+  geom_point(aes(color=factor(fold))) +
+  geom_point(data=trees_km$centers, pch=4) +
+  scale_size_area() +
+  coord_quickmap() +
+  labs(color="Cluster") +
+  theme_void()
+```
+
+Now we can use the clusters to determine the area of applicability.
+
+```{r area-of-applicability}
+trees_geo <- st_as_sf(trees_coords, coords=c("long", "lat"))
+trees_geo <- st_set_crs(trees_geo, 4326)
+
+aoa_buffer <- trees_coords %>%
+  select(long, lat) %>%
+  get_out_of_fold_distance(trees_coords$fold) %>%
+  get_upper_whisker()
+
+aoa <- trees_geo %>%
+  st_buffer(aoa_buffer) %>%
+  st_union()
+
+world <- ne_countries(scale="medium", returnclass="sf")
+
+bounds <- st_bbox(aoa)
+
+ggplot(data=world) +
+  geom_sf() +
+  geom_sf(data=aoa, alpha=0.2, color="blue") +
+  geom_sf(data=trees_geo, mapping=aes(color=factor(fold))) +
+  coord_sf(xlim=c(bounds[1], bounds[3]), ylim=c(bounds[2], bounds[4]))
+  
+```
+
+The blue outline defines the region where we can run the model for future inference and expect to have similar performance metrics to what we find during spatial CV. 
+
+## Spatial CV
+
+Now, let's run the cross-validation workflow. Each fold requires us to build an entire isoscape, so a good first step is to prepare the elevation raster.
+
+```{r get-elevation}
+tfile <- tempfile(fileext=".tif")
+
+getelev(
+  file=tfile,
+  z=4,
+  long_min=bounds[1],
+  long_max=bounds[3],
+  lat_min=bounds[2],
+  lat_max=bounds[4],
+)
+
+elev <- rast(tfile)
+elev[elev < 0] <- 0
+plot(elev)
+```
+
+We also know that harvests could not occur in water, so we also have a mask for the oceans and Great Lakes.
+
+```{r get-mask}
+water_mask <- vect("../data_in/watermask.shp")
+plot(water_mask, col="lightblue", values=rep(1, length(water_mask)), background="#689c72", legend=FALSE)
+```
+
+The steps of spatial cross-validation are, for each fold:
+ - Separate the training and validation points.
+ - Fit a model to the training points.
+ - Evaluate the model on the validation points.
+
+```{r spatial-cv, echo=TRUE, results="hide"}
+
+sirs <- c("d18o", "d2h", "d13c", "d34s")
+
+fit_isorix_model <- function(train, valid) {
+  fit <- train %>%
+    isofit(
+      mean_model_fix=list(elev=TRUE, lat_abs=TRUE, long=TRUE),
+      disp_model_fix=list(elev=TRUE, lab_abs=TRUE, long=TRUE)
+    )
+  
+  elev_prep <- prepraster(
+    raster=elev,
+    manual_crop=bounds,
+    margin_pct=0,
+    aggregation_factor=2
+  )
+  
+  iso <- isoscape(
+    raster = elev_prep,
+    isofit = fit
+  )
+  
+  valid <- valid %>%
+    mutate(sample_ID = paste("sample", row_number(), sep="_")) %>%
+    rename(sample_value=mean_source_value,
+           site_ID=source_ID)
+  
+  # This suppresses the warning that we do not have a calibration model.
+  # Such a model is not necessary because we are fitting to organismal
+  # SIR data.
+  locs <- suppressWarnings(isofind(
+    data = valid,
+    isoscape = iso,
+    mask = water_mask
+  ))
+  
+  return(locs)
+}
+
+get_isorix_data <- function(df, target_sir) {
+  df %>%
+    rename(source_value=!!target_sir) %>%
+    prepsources() %>%
+    arrange(long, lat) %>%
+    mutate(lat_abs=abs(lat))
+}
+
+eval_isorix_model <- function(pval_rasters, valid) {
+  valid_performance <- list_rbind(map(1:nrow(valid), function(ind) {
+    true_xy <- cbind(valid$long[ind], valid$lat[ind])
+    p_rast  <- pval_rasters[[ind]]
+    p_rast_norm <- normalize_raster(p_rast)
+    
+    data.frame(
+      mae=get_mean_absolute_error(p_rast_norm, true_xy),
+      ash=get_area_scored_higher(p_rast, true_xy),
+      mode_dist=get_mode_distance(p_rast, true_xy),
+      log_prob=log(extract(p_rast, true_xy))[1, 1]
+    )
+  }))
+  
+  return(valid_performance)
+}
+
+eval_fold_sir_ablation <- function(fold_num) {
+  # Separate training/validation
+  validation <- trees_iso$fold == fold_num
+    
+  trees_train <- trees_iso[!validation, ]
+  trees_valid <- trees_iso[ validation, ]
+  
+  # Fit models for each SIR
+  locs <- map(sirs, function(s) {
+    train <- get_isorix_data(trees_train, s)
+    valid <- get_isorix_data(trees_valid, s)
+    
+    invisible(fit_isorix_model(train, valid))
+  })
+  
+  this_pv <- 1
+  valid_coords <- trees_valid %>% select(long, lat) %>% distinct() %>%
+    arrange(long, lat)
+  
+  valid_result <- list_rbind(map(1:length(sirs), function(i) {
+    this_pv <- this_pv * locs[[i]]$sample$pv
+    this_combo <- paste0(sirs[1:i], collapse=" + ")
+    
+    eval_isorix_model(this_pv, valid_coords) %>%
+      summarize(across(everything(), mean)) %>%
+      mutate(sirs=this_combo)
+  })) %>%
+    mutate(fold=fold_num)
+  
+  list(
+    valid_result=valid_result,
+    locs=locs
+  )
+}
+
+ablate_result <- map(unique(trees_iso$fold), eval_fold_sir_ablation)
+```
+
+```{r}
+list_rbind(map(ablate_result, function(x) x$valid_result)) %>%
+  group_by(sirs) %>%
+  summarize(across(everything(), mean))
+```
+
+```{r}
+fold <- 4
+fold_idx <- match(fold, unique(trees_iso$fold))
+sample_idx <- 3
+
+true_xy <- trees_iso %>% filter(fold==fold) %>% nth(sample_idx) %>% 
+  select(long, lat) %>% as.matrix() %>% vect(crs="EPSG:4326")
+
+sir_pv_stack = rast(sapply(
+  1:length(sirs),
+  function(i) ablate_result[[fold_idx]]$locs[[i]]$sample$pv[[sample_idx]]
+))
+names(sir_pv_stack) <- sirs
+plot(sir_pv_stack, fun=\() points(true_xy, col="red", pch=4, cex=2))
+```
