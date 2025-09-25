@@ -13,6 +13,12 @@ get_mode_distance <- function(r, x) {
   return(as.numeric(sf::st_distance(x_geo, x_mode_geo)[1, 1]/1000))
 }
 
+normalize_raster <- function(r) {
+  # Convert a raster to a probability distribution
+  # by dividing by its sum.
+  return(r / sum(terra::values(r)))
+}
+
 get_mean_absolute_error <- function(r, x) {
   # Calculate performance metric 3 from Truszkowski et al.
   # x is a 1x2 matrix coordinate, r is a *probability 
