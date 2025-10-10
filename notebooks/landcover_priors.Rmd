@@ -1,0 +1,284 @@
+---
+title: "Landcover-based Priors"
+author: "Keenan Ganz"
+output:
+  pdf_document: default
+  html_notebook: default
+bibliography: isoscapes.bib
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(IsoriX)
+library(lubridate)
+library(janitor)
+library(terra)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+theme_set(theme_bw())
+
+source("../scripts/aoa.R")
+source("../scripts/metrics.R")
+```
+
+The previous SIR ablation experiment showed that $\delta^{18}$O and $\delta^2$H are the most effective SIRs for timber source tracing. In this notebook, we perform a similar ablation study on using land cover to refine the probability raster of each sample. As before, we employ a spatial cross-validation design to quantify uncertainty.
+
+## Priors
+
+We begin with percent cover rasters for each of the following land cover categories:
+
+-   forest
+
+-   *Quercus spp.* basal area
+
+-   cropland
+
+-   urban & bare land
+
+-   sparse vegetation
+
+-   water (excluding the ocean & Great Lakes)
+
+The first step is to reproject these to match the projection of the elevation raster, which defines the extent and resolution of the isoscape. Forest cover and *Quercus* basal area are *inclusive* of harvest likelihood (forest cover, *Quercus* BA) while the other landcover types are *exclusive* of harvest likelihood. We modify the rasters such that higher values correspond to greater likelihood of harvest.
+
+```{r prep-elev}
+elev <- rast("../data_in/elevation_world.tif")
+bounds <- ext(elev)
+elev <- prepraster(
+  elev, 
+  margin_pct=0, 
+  aggregation_factor=2, 
+  manual_crop=bounds
+)
+elev
+```
+
+```{r reproject-priors}
+prior_files <- list.files("../data_in/priors/", full.names=TRUE)
+priors <- list()
+
+for (p in prior_files) {
+  r <- rast(p)
+  name <- tools::file_path_sans_ext(basename(p))
+  priors[[name]] <- project(r, elev)
+}
+priors$quercus_ba <- priors$quercus_ba / max(values(priors$quercus_ba))
+priors$crop <- 1-priors$crop
+priors$sparse_veg <- 1-priors$sparse_veg
+priors$urban_bare <- 1-priors$urban_bare
+priors$water <- 1-priors$water
+# Baseline where we have no new prior
+priors$baseline <- 1
+suppressWarnings(plot(rast(priors)))
+```
+
+## SIR data
+
+This is just a repeat of the data preparation steps in the previous notebook. As before we make 5 clusters with k-means for spatial CV.
+
+```{r kmeans}
+trees <- read_csv("../data_in/Tree_ds_sep16.csv") %>%
+  clean_names() %>%
+  # Drop observations on west coast
+  filter(longitude > -100) %>%
+  # Parse datetimes
+  mutate(date_collected = parse_date_time(date_collected, orders=c("dmy", "mdy")))
+
+# Convert to isorix format
+trees_iso <- trees %>%
+  transmute(
+    source_ID = factor(paste("site", latitude, longitude, elevation_dem, sep = "_")),
+    lat=latitude,
+    long=longitude,
+    elev=elevation_dem,
+    year=year(date_collected),
+    month=month(date_collected),
+    d18o=d18o,
+    d2h=d2h,
+    d13c=d13c,
+    d34s=d34s
+  )
+
+# Discard duplicate points when assigning to folds
+trees_coords <- trees_iso %>%
+  select(long, lat) %>%
+  distinct()
+
+# Run kmeans on coordinates, assign fold
+trees_km <- kmeans(trees_coords, centers=5)
+trees_coords$fold <- trees_km$cluster
+trees_iso <- left_join(trees_iso, trees_coords, by=c("long", "lat"))
+
+# Map of cluster and centroids
+trees_iso %>%
+  ggplot(aes(long, lat)) +
+  annotation_borders("state") +
+  geom_point(aes(color=factor(fold))) +
+  geom_point(data=trees_km$centers, pch=4) +
+  scale_size_area() +
+  coord_quickmap() +
+  labs(color="Cluster") +
+  theme_void()
+```
+
+## Spatial CV
+
+```{r spatial-cv}
+sirs_to_fit <- c("d18o", "d2h")
+water_mask <- vect("../data_in/watermask.shp")
+
+fit_isorix_model <- function(train, valid) {
+  fit <- train %>%
+    isofit(
+      mean_model_fix=list(elev=TRUE),
+      disp_model_fix=list(elev=TRUE),
+      # Force separate length scale parameters for lat/lon
+      # when calculating Matern kernel.
+      #control_mean=list(
+      #  control.dist=list(rho.mapping=c(1, 2))
+      #)
+    )
+  
+  iso <- isoscape(
+    raster = elev,
+    isofit = fit
+  )
+  
+  valid <- valid %>%
+    mutate(sample_ID = paste("sample", row_number(), sep="_")) %>%
+    rename(sample_value=mean_source_value,
+           site_ID=source_ID)
+  
+  # This suppresses the warning that we do not have a calibration model.
+  # Such a model is not necessary because we are fitting to organismal
+  # SIR data.
+  locs <- suppressWarnings(isofind(
+    data = valid,
+    isoscape = iso,
+    mask = water_mask
+  ))
+  
+  return(locs)
+}
+
+get_isorix_data <- function(df, target_sir) {
+  df %>%
+    rename(source_value=!!target_sir) %>%
+    prepsources() %>%
+    arrange(long, lat) %>%
+    mutate(lat_abs=abs(lat))
+}
+
+eval_isorix_model <- function(pval_rasters, valid) {
+  valid_performance <- list_rbind(map(1:nrow(valid), function(ind) {
+    true_xy <- cbind(valid$long[ind], valid$lat[ind])
+    p_rast  <- pval_rasters[[ind]]
+    p_rast_norm <- normalize_raster(p_rast)
+    
+    data.frame(
+      mae=get_mean_absolute_error(p_rast_norm, true_xy),
+      ash=get_area_scored_higher(p_rast, true_xy),
+      mode_dist=get_mode_distance(p_rast, true_xy),
+      log_prob=log(extract(p_rast, true_xy))[1, 1]
+    )
+  }))
+  
+  return(valid_performance)
+}
+
+eval_fold_prior_ablation <- function(fold_num) {
+  # Separate training/validation
+  validation <- trees_iso$fold == fold_num
+    
+  trees_train <- trees_iso[!validation, ]
+  trees_valid <- trees_iso[ validation, ]
+  
+  # Fit models for each SIR
+  locs <- map(sirs_to_fit, function(s) {
+    train <- get_isorix_data(trees_train, s)
+    valid <- get_isorix_data(trees_valid, s)
+    
+    invisible(fit_isorix_model(train, valid))
+  })
+  
+  # Collapse the d18o and d2h models together
+  total_pv <- locs[[1]]$sample$pv * locs[[2]]$sample$pv
+  
+  # Get validation coords for evaluation
+  valid_coords <- trees_valid %>% select(long, lat) %>% distinct() %>%
+    arrange(long, lat)
+  
+  # Multiply by each prior and evaluate
+  valid_result <- list_rbind(map(names(priors), function (p) {
+    this_pv <- total_pv * priors[[p]]
+    eval_result <- eval_isorix_model(this_pv, valid_coords)
+    eval_result$fold <- fold_num
+    eval_result$prior <- p
+    eval_result$sample_num <- 1:nrow(eval_result)
+    return(eval_result)
+  }))
+  
+  return(valid_result)
+}
+```
+
+```{r do-ablation, message=FALSE, warning=FALSE, cache=TRUE}
+ablate_result <- list_rbind(map(
+  unique(trees_iso$fold), 
+  eval_fold_prior_ablation
+))
+```
+
+## Summarize results
+
+```{r summarize-performance}
+baseline <- ablate_result %>%
+  filter(prior == "baseline")
+baseline
+```
+
+```{r}
+# Match baseline performance with each prior, calculate relative
+# difference.
+baseline_longer <- baseline %>%
+  select(-prior) %>%
+  pivot_longer(
+    -c(fold, sample_num), 
+    names_to="baseline_metric", 
+    values_to="baseline_value"
+  )
+
+relative_performance <- ablate_result %>%
+  pivot_longer(
+    -c(fold, prior, sample_num), 
+    names_to="metric", 
+    values_to="value"
+  ) %>%
+  left_join(
+    baseline_longer, 
+    by=c("metric"="baseline_metric", "fold", "sample_num")
+  )
+
+```
+
+```{r}
+relative_performance %>%
+  mutate(
+    rel_diff = (value - baseline_value) / baseline_value,
+    metric_label = recode(
+      metric,
+      "ash"="Area scored higher (smaller better)",
+      "log_prob"="Log probability (larger better)",
+      "mae"="Mean absolute error (smaller better)",
+      "mode_dist"="Mode distance (smaller better)"
+    )
+  ) %>%
+  ggplot(aes(x=prior, y=rel_diff)) +
+  geom_hline(yintercept=0, linetype="dashed") +
+  geom_boxplot() +
+  coord_flip() +
+  facet_wrap(~ metric_label, scales="free_x") +
+  labs(x="Prior", y="Relative difference from baseline prior")
+
+```
