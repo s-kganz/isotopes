@@ -5,6 +5,7 @@
 
 data_in/
 data_working/
+data_out/
 
 *.bib
 *.nb.html
